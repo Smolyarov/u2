@@ -34,6 +34,7 @@
  ******************************************************************************
  */
 extern mavlink_highres_imu_t          mavlink_out_highres_imu_struct;
+extern chibios_rt::EvtSource event_gnss;
 
 #if KALMAN_DEBUG_LOG
 extern MavLogger mav_logger;
@@ -45,11 +46,12 @@ extern MavLogger mav_logger;
  ******************************************************************************
  */
 
-typedef float klmnfp;
+typedef float  klmnfp;
+typedef double sinsfp;
 #define KALMAN_STATE_SIZE         15
-#define KALMAN_MEASUREMENT_SIZE   10
+#define KALMAN_MEASUREMENT_SIZE   9
 
-__CCM__ static NavigatorSins<klmnfp, KALMAN_STATE_SIZE, KALMAN_MEASUREMENT_SIZE> nav_sins;
+__CCM__ static NavigatorSins<sinsfp, klmnfp, KALMAN_STATE_SIZE, KALMAN_MEASUREMENT_SIZE> nav_sins;
 
 __CCM__ static mavlink_navi6d_debug_input_t   dbg_in_struct;
 __CCM__ static mavlink_navi6d_debug_output_t  dbg_out_struct;
@@ -97,7 +99,6 @@ static void dbg_in_fill_gnss(const gnss::gnss_data_t &data) {
   dbg_in_struct.gnss_alt        = data.altitude;
   dbg_in_struct.gnss_course     = data.course;
   dbg_in_struct.gnss_fix_type   = data.fix;
-  dbg_in_struct.gnss_fresh      = data.fresh;
   dbg_in_struct.gnss_speed_type = (uint8_t)data.speed_type;
   dbg_in_struct.gnss_speed      = data.speed;
   for (size_t i=0; i<3; i++) {
@@ -280,8 +281,8 @@ void Navi6dWrapper::navi2acs(void) {
   acs_in.ch[ACS_INPUT_pitch]= data.eu_nv[1][0];
   acs_in.ch[ACS_INPUT_yaw]  = data.eu_nv[2][0];
 
-  acs_in.ch[ACS_INPUT_lat] = rad2deg(data.r[0][0]);
-  acs_in.ch[ACS_INPUT_lon] = rad2deg(data.r[1][0]);
+  acs_in.ch[ACS_INPUT_lat] = data.r[0][0];
+  acs_in.ch[ACS_INPUT_lon] = data.r[1][0];
   acs_in.ch[ACS_INPUT_alt] = data.r[2][0];
 
   acs_in.ch[ACS_INPUT_vx] = data.v[0][0];
@@ -356,8 +357,8 @@ GNSS(GNSS)
  */
 void Navi6dWrapper::start(void) {
 
-  gps.fresh = false;
   GNSS.subscribe(&gps);
+  event_gnss.registerMask(&this->gnss_evl, EVMSK_GNSS_FRESH_VALID | EVMSK_GNSS_PPS);
 
   read_settings();
   restart_cache = *restart + 1; // enforce sins restart in first update call
@@ -381,6 +382,7 @@ void Navi6dWrapper::start(void) {
 void Navi6dWrapper::stop(void) {
   ready = false;
   GNSS.unsubscribe(&gps);
+  event_gnss.unregister(&this->gnss_evl);
 }
 
 /**
@@ -393,13 +395,6 @@ void Navi6dWrapper::update(const baro_data_t &baro,
 
   start_time_measurement();
 
-  /* reapply new dT if needed */
- /* if (this->dT_cache != marg.dT) {
-    this->dT_cache = marg.dT;
-    nav_sins.params.init_params.dT = marg.dT;
-    nav_sins.params.init_params.rst_dT = 0.5;
-  }*/
-
   /* restart sins if requested */
   if (*restart != restart_cache) {
     sins_cold_start();
@@ -407,15 +402,9 @@ void Navi6dWrapper::update(const baro_data_t &baro,
   }
 
   nav_sins.init_params.dT = marg.dT;
-  nav_sins.init_params.rst_dT = 0.1;
 
-  nav_sins.kalman_params.sigma_R.gnss_n = *R_ne_sns; //ne_sns
-  nav_sins.kalman_params.sigma_R.gnss_e = *R_ne_sns; //ne_sns
-  nav_sins.kalman_params.sigma_R.gnss_d = *R_d_sns; //d_sns
-
-  nav_sins.kalman_params.sigma_R.gnss_vn = *R_v_n_sns; //v_n_sns
-  nav_sins.kalman_params.sigma_R.gnss_ve = *R_v_n_sns; //v_n_sns
-  nav_sins.kalman_params.sigma_R.gnss_vd = *R_v_n_sns; //v_n_sns
+  nav_sins.kalman_params.gnss_mean_pos_sigma = *R_pos_sns;
+  nav_sins.kalman_params.gnss_mean_vel_sigma = *R_vel_sns;
 
   nav_sins.kalman_params.sigma_R.v_odo_x = *R_odo; //odo
   nav_sins.kalman_params.sigma_R.v_nhl_y = *R_nhl_y; //nonhol
@@ -521,6 +510,13 @@ void Navi6dWrapper::update(const baro_data_t &baro,
   nav_sins.ref_params.eu_vh_base[1][0] = *eu_vh_pitch;
   nav_sins.ref_params.eu_vh_base[2][0] = *eu_vh_yaw;
 
+  nav_sins.ref_params.zupt_source     = *zupt_src;
+  nav_sins.ref_params.glrt_gamma      = *gamma;
+  nav_sins.ref_params.glrt_acc_sigma  = *acc_sigma;
+  nav_sins.ref_params.glrt_gyr_sigma  = *gyr_sigma;
+  nav_sins.ref_params.glrt_n          = *samples;
+  nav_sins.ref_params.sns_extr_en     = true;
+
   nav_sins.calib_params.ba[0][0] = *acc_bias_x;
   nav_sins.calib_params.ba[1][0] = *acc_bias_y;
   nav_sins.calib_params.ba[2][0] = *acc_bias_z;
@@ -536,13 +532,6 @@ void Navi6dWrapper::update(const baro_data_t &baro,
   nav_sins.calib_params.sw[0][0] = *gyr_scale_x;
   nav_sins.calib_params.sw[1][0] = *gyr_scale_y;
   nav_sins.calib_params.sw[2][0] = *gyr_scale_z;
-
-  nav_sins.ref_params.zupt_source = *zupt_src;
-  nav_sins.ref_params.glrt_gamma = *gamma;
-  nav_sins.ref_params.glrt_acc_sigma = *acc_sigma;
-  nav_sins.ref_params.glrt_gyr_sigma = *gyr_sigma;
-  nav_sins.ref_params.glrt_n = *samples;
-  nav_sins.init_params.fog_en = false;
 
   dbg_in_fill_gnss(this->gps);
   prepare_data_gnss(this->gps);
